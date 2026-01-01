@@ -5,7 +5,7 @@ const app = express();
 
 // Configuration
 const SECRET_TOKEN = process.env.WEBHOOK_SECRET_TOKEN || "37ehADKNLy5psq1IvdUDYshxx_zuy2RYD72n7E858DYqR2";
-const HOST = process.env.HOST || "0.0.0.0";
+const HOST0.0.0.0";
 const PORT = process.env.PORT || 8443;
 const SSL_CERT_PATH = process.env.SSL_CERT_PATH || "cert.pem";
 const SSL_KEY_PATH = process.env.SSL_KEY_PATH || "key.pem";
@@ -124,7 +124,7 @@ app.post("/webhook", (req, res) => {
 
 /**
  * GET /get_signal
- * Endpoint for EA to poll and retrieve the latest numeric signal.
+ * Endpoint for EA to poll and retrieve the numeric signal.
  * Returns signal and auto-resets to 0 (prevents duplicate trades).
  */
 app.get("/get_signal", (req, res) => {
@@ -146,7 +146,20 @@ app.get("/get_signal", (req, res) => {
 });
 
 /**
-  and status endpoint
+ * GET /health
+ * Lightweight health check endpoint for external uptime monitors
+ * (UptimeRobot, Pingdom, etc.)
+ */
+app.get("/health", (req, res) => {
+    res.status(200).json({ 
+        status: "ok", 
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
+});
+
+/**
+ * GET / - Main status endpoint
  */
 app.get("/", (req, res) => {
     res.status(200).json({
@@ -156,7 +169,15 @@ app.get("/", (req, res) => {
     });
 });
 
-// Server startup logic - FIXED ✅
+/**
+ * 🔥 KEEP-ALIVE PING - Internal heartbeat every 1 minute
+ * Logs to console to prevent server sleep on free hosting platforms
+ */
+setInterval(() => {
+    console.log(`🔄 Ping... [${new Date().toISOString()}]`);
+}, 60000); // 60,000 ms = 1 minute
+
+// Server startup logic
 const startServer = () => {
     const hasSSL = fs.existsSync(SSL_CERT_PATH) && fs.existsSync(SSL_KEY_PATH);
     
@@ -168,6 +189,7 @@ const startServer = () => {
             };
             https.createServer(options, app).listen(PORT, HOST, () => {
                 console.log(`✅ HTTPS server on https://${HOST}:${PORT}`);
+                console.log(`🔥 Health endpoint active: /health`);
             });
         } catch (err) {
             console.error(`⚠️  SSL Error: ${err.message}`);
@@ -182,9 +204,11 @@ const startHTTP = () => {
     app.listen(PORT, HOST, () => {
         console.log(`⚠️  HTTP server on http://${HOST}:${PORT} (development only)`);
         console.log(`📝 Place cert.pem and key.pem for HTTPS support`);
+        console.log(`🔥 Health endpoint active: /health`);
     });
 };
 
 // Start server
 startServer();
 console.log(`🔐 Webhook Secret Configured: ${!!process.env.WEBHOOK_SECRET_TOKEN}`);
+console.log(`⏰ Keep-alive ping active every 1 minute`);
