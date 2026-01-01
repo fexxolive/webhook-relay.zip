@@ -4,7 +4,7 @@ const fs = require('fs');
 const app = express();
 
 // Configuration
-const SECRET_TOKEN = process.env.WEBHOOK_SECRET_TOKEN || "37ehADKNLy5psq1IvdUDYshxxik_zuy2RYD72n7E858DYqR2";
+const SECRET_TOKEN = process.env.WEBHOOK_SECRET_TOKEN || "37ehADKNLy5psq1IvdUDYshxx_zuy2RYD72n7E858DYqR2";
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = process.env.PORT || 8443;
 const SSL_CERT_PATH = process.env.SSL_CERT_PATH || "cert.pem";
@@ -146,8 +146,7 @@ app.get("/get_signal", (req, res) => {
 });
 
 /**
- * GET /
- * Health check and status endpoint
+  and status endpoint
  */
 app.get("/", (req, res) => {
     res.status(200).json({
@@ -157,8 +156,8 @@ app.get("/", (req, res) => {
     });
 });
 
-// Server startup logic
-const start Check if SSL certificates exist
+// Server startup logic - FIXED ✅
+const startServer = () => {
     const hasSSL = fs.existsSync(SSL_CERT_PATH) && fs.existsSync(SSL_KEY_PATH);
     
     if (hasSSL) {
