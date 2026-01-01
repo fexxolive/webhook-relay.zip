@@ -5,7 +5,7 @@ const app = express();
 
 // Configuration
 const SECRET_TOKEN = process.env.WEBHOOK_SECRET_TOKEN || "37ehADKNLy5psq1IvdUDYshxx_zuy2RYD72n7E858DYqR2";
-const HOST0.0.0.0";
+const HOST = "0.0.0.0";
 const PORT = process.env.PORT || 8443;
 const SSL_CERT_PATH = process.env.SSL_CERT_PATH || "cert.pem";
 const SSL_KEY_PATH = process.env.SSL_KEY_PATH || "key.pem";
