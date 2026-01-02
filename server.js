@@ -3,181 +3,373 @@ const https = require('https');
 const fs = require('fs');
 const app = express();
 
-// Configuration
-const SECRET_TOKEN = process.env.WEBHOOK_SECRET_TOKEN || "37ehADKNLy5psq1IvdUDYshxx_zuy2RYD72n7E858DYqR2";
+// ==================== CONFIGURATION ====================
+const SECRET_TOKEN = process.env.WEBHOOK_SECRET_TOKEN || "37ehADKNLy5psq1IvdUDYshxxik_zuy2RYD72n7E858DYqR2";
 const HOST = "0.0.0.0";
 const PORT = process.env.PORT || 8443;
 const SSL_CERT_PATH = process.env.SSL_CERT_PATH || "cert.pem";
 const SSL_KEY_PATH = process.env.SSL_KEY_PATH || "key.pem";
 
-// Middleware
+// ==================== MIDDLEWARE ====================
 app.use(express.json());
 
-// In-memory signal storage
+// Request logging middleware
+app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    next();
+});
+
+// ==================== SIGNAL STORAGE ====================
 let latest_signal = {
     signal: 0,
     symbol: "",
     timestamp: null,
-    action: ""
+    action: "",
+    id: ""
 };
+
+// Signal history for debugging (last 50 signals)
+const signal_history = [];
+const MAX_HISTORY = 50;
+
+// ==================== UTILITY FUNCTIONS ====================
+
+/**
+ * Log signal with history tracking
+ */
+function logSignal(signal_obj) {
+    signal_history.push({
+        ...signal_obj,
+        receivedAt: new Date().toISOString()
+    });
+    
+    if (signal_history.length > MAX_HISTORY) {
+        signal_history.shift();
+    }
+    
+    console.log(`[SIGNAL-STORED] ${signal_obj.action} | ${signal_obj.symbol} | Numeric: ${signal_obj.signal}`);
+}
+
+/**
+ * Validate token from header or body
+ */
+function validateToken(req) {
+    let token = req.headers["x-webhook-token"] || "";
+    
+    if (!token && req.body) {
+        token = req.body.secret || "";
+    }
+    
+    return token === SECRET_TOKEN;
+}
+
+/**
+ * Sanitize input
+ */
+function sanitize(str) {
+    if (typeof str !== 'string') return "";
+    return str.trim().toUpperCase();
+}
+
+/**
+ * Generate signal ID (for deduplication)
+ */
+function generateSignalId() {
+    return `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+// ==================== API ENDPOINTS ====================
 
 /**
  * POST /webhook
- * Accept token from X-Webhook-Token header or 'secret' field in JSON body.
- * Convert BUY/SELL actions to numeric signals and store them.
+ * Handle TradingView alerts and MT5 EA get_signal requests
  */
 app.post("/webhook", (req, res) => {
-    // Get token from header
-    let token = req.headers["x-webhook-token"] || "";
+    // Validate token
+    if (!validateToken(req)) {
+        return res.status(401).json({
+            status: "unauthorized",
+            message: "Invalid or missing token",
+            timestamp: new Date().toISOString()
+        });
+    }
     
     // Validate request body
     const payload = req.body;
     if (!payload || typeof payload !== 'object') {
         return res.status(400).json({
             status: "bad_request",
-            message: "invalid json"
+            message: "Invalid JSON payload",
+            timestamp: new Date().toISOString()
         });
     }
     
-    // Fallback: get token from JSON body if header is empty
-    if (!token) {
-        token = payload.secret || "";
-    }
+    // Get event type
+    const event_type = sanitize(payload.event || "");
     
-    // Validate token
-    if (token !== SECRET_TOKEN) {
-        return res.status(401).json({
-            status: "unauthorized",
-            message: "invalid or missing token"
-        });
-    }
-    
-    // Validate required 'event' field
-    if (!payload.event) {
+    if (!event_type) {
         return res.status(400).json({
             status: "bad_request",
-            message: "missing 'event' field"
+            message: "Missing 'event' field",
+            timestamp: new Date().toISOString()
         });
     }
     
-    const event_type = payload.event;
-    
-    // Handle ping event
-    if (event_type === "ping") {
+    // ========== PING EVENT ==========
+    if (event_type === "PING") {
         return res.status(200).json({
             status: "ok",
-            message: "pong"
+            message: "pong",
+            timestamp: new Date().toISOString()
         });
     }
     
-    // Handle alert event (TradingView signals)
-    else if (event_type === "alert") {
-        const symbol = payload.symbol || "";
-        const action = payload.action || payload.signal || "";
+    // ========== ALERT EVENT (TradingView) ==========
+    else if (event_type === "ALERT") {
+        const symbol = sanitize(payload.symbol || "");
+        const action = sanitize(payload.action || payload.signal || "");
         const price = payload.price || "";
+        const timeframe = payload.timeframe || "";
         
-        // Convert action to numeric signal: BUY → 1, SELL → -1
-        let numeric_signal = 0;
-        if (action && typeof action === 'string') {
-            const action_upper = action.toUpperCase();
-            if (action_upper === "BUY") {
-                numeric_signal = 1;
-            } else if (action_upper === "SELL") {
-                numeric_signal = -1;
-            }
+        // Validate symbol
+        if (!symbol) {
+            return res.status(400).json({
+                status: "bad_request",
+                message: "Symbol is required for ALERT event",
+                timestamp: new Date().toISOString()
+            });
         }
+        
+        // Validate action
+        if (!["BUY", "SELL"].includes(action)) {
+            return res.status(400).json({
+                status: "bad_request",
+                message: `Invalid action: "${action}". Expected BUY or SELL`,
+                timestamp: new Date().toISOString()
+            });
+        }
+        
+        // Convert action to numeric signal
+        const numeric_signal = action === "BUY" ? 1 : -1;
+        const signal_id = generateSignalId();
         
         // Store signal
         latest_signal = {
             signal: numeric_signal,
             symbol: symbol,
             action: action,
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            id: signal_id,
+            price: price,
+            timeframe: timeframe
         };
         
-        console.log(`[ALERT] Symbol: ${symbol}, Action: ${action}, Signal: ${numeric_signal}, Price: ${price}`);
+        // Log to history
+        logSignal(latest_signal);
+        
+        console.log(`✅ [ALERT-RECEIVED] Symbol: ${symbol} | Action: ${action} | Price: ${price} | TF: ${timeframe}`);
         
         return res.status(200).json({
             status: "ok",
-            message: "alert received",
-            signal: numeric_signal
+            message: "Alert received and stored",
+            signal: numeric_signal,
+            id: signal_id,
+            timestamp: new Date().toISOString()
         });
     }
     
-    // Handle create event
-    else if (event_type === "create") {
-        const data = payload.data || {};
+    // ========== GET_SIGNAL EVENT (MT5 EA) ==========
+    else if (event_type === "GET_SIGNAL") {
+        if (latest_signal.signal !== 0) {
+            const signal_to_send = {
+                signal: latest_signal.signal,
+                symbol: latest_signal.symbol,
+                action: latest_signal.action,
+                timestamp: latest_signal.timestamp,
+                id: latest_signal.id
+            };
+            
+            // Reset after retrieval (prevent duplicate trades)
+            console.log(`📤 [SIGNAL-SENT] ${latest_signal.action} | ${latest_signal.symbol} | ID: ${latest_signal.id}`);
+            latest_signal.signal = 0;
+            
+            return res.status(200).json({
+                status: "ok",
+                ...signal_to_send
+            });
+        } else {
+            return res.status(200).json({
+                status: "no_signal",
+                signal: 0
+            });
+        }
+    }
+    
+    // ========== CREATE EVENT ==========
+    else if (event_type === "CREATE") {
         return res.status(201).json({
             status: "created",
-            data: data
+            data: payload.data || {},
+            timestamp: new Date().toISOString()
         });
     }
     
-    // Unknown event type
+    // ========== UNKNOWN EVENT ==========
     else {
         return res.status(202).json({
             status: "ignored",
-            message: `unknown event ${event_type}`
+            message: `Unknown event type: ${event_type}`,
+            timestamp: new Date().toISOString()
         });
     }
+});
+
+/**
+ * POST /webhook/signal
+ * Alternative endpoint (same functionality as POST /webhook with GET_SIGNAL)
+ */
+app.post("/webhook/signal", (req, res) => {
+    if (!validateToken(req)) {
+        return res.status(401).json({
+            status: "unauthorized",
+            message: "Invalid or missing token"
+        });
+    }
+    
+    if (latest_signal.signal !== 0) {
+        const signal_to_send = {
+            signal: latest_signal.signal,
+            symbol: latest_signal.symbol,
+            action: latest_signal.action,
+            timestamp: latest_signal.timestamp,
+            id: latest_signal.id
+        };
+        
+        latest_signal.signal = 0;
+        
+        return res.json({
+            status: "ok",
+            ...signal_to_send
+        });
+    }
+    
+    return res.json({
+        status: "no_signal",
+        signal: 0
+    });
 });
 
 /**
  * GET /get_signal
- * Endpoint for EA to poll and retrieve the numeric signal.
- * Returns signal and auto-resets to 0 (prevents duplicate trades).
+ * Legacy endpoint for backward compatibility
  */
 app.get("/get_signal", (req, res) => {
-    if (latest_signal.signal !== 0) {
-        const signal_to_return = latest_signal.signal;
-        latest_signal.signal = 0; // Reset after retrieval
-        
-        return res.status(200).json({
-            signal: signal_to_return,
-            symbol: latest_signal.symbol,
-            action: latest_signal.action,
-            timestamp: latest_signal.timestamp
-        });
-    } else {
-        return res.status(200).json({
-            signal: 0
+    const token = req.headers["x-webhook-token"] || req.query.token || "";
+    
+    if (token !== SECRET_TOKEN) {
+        return res.status(401).json({
+            status: "unauthorized",
+            message: "Invalid or missing token"
         });
     }
+    
+    if (latest_signal.signal !== 0) {
+        const signal_to_send = {
+            signal: latest_signal.signal,
+            symbol: latest_signal.symbol,
+            action: latest_signal.action,
+            timestamp: latest_signal.timestamp,
+            id: latest_signal.id
+        };
+        
+        latest_signal.signal = 0;
+        
+        return res.json({
+            status: "ok",
+            ...signal_to_send
+        });
+    }
+    
+    return res.json({
+        status: "no_signal",
+        signal: 0
+    });
 });
 
 /**
  * GET /health
- * Lightweight health check endpoint for external uptime monitors
- * (UptimeRobot, Pingdom, etc.)
+ * Health check for uptime monitoring
  */
 app.get("/health", (req, res) => {
-    res.status(200).json({ 
-        status: "ok", 
+    res.status(200).json({
+        status: "healthy",
+        uptime: process.uptime(),
         timestamp: new Date().toISOString(),
-        uptime: process.uptime()
+        latest_signal_state: latest_signal.signal
     });
 });
 
 /**
- * GET / - Main status endpoint
+ * GET /status
+ * Detailed status endpoint
+ */
+app.get("/status", (req, res) => {
+    res.json({
+        status: "running",
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+        latest_signal: latest_signal,
+        recent_history: signal_history.slice(-10),
+        total_signals_processed: signal_history.length
+    });
+});
+
+/**
+ * GET /
+ * Main status page
  */
 app.get("/", (req, res) => {
-    res.status(200).json({
+    const hasSSL = fs.existsSync(SSL_CERT_PATH) && fs.existsSync(SSL_KEY_PATH);
+    
+    res.json({
         status: "running",
-        secure: fs.existsSync(SSL_CERT_PATH) && fs.existsSync(SSL_KEY_PATH),
-        latest_signal: latest_signal
+        secure: hasSSL,
+        endpoints: {
+            "POST /webhook": "Main webhook endpoint (TradingView + EA)",
+            "POST /webhook/signal": "Alternative signal endpoint",
+            "GET /get_signal": "Legacy signal retrieval",
+            "GET /health": "Health check",
+            "GET /status": "Detailed status"
+        },
+        latest_signal: latest_signal,
+        timestamp: new Date().toISOString()
     });
 });
 
 /**
- * 🔥 KEEP-ALIVE PING - Internal heartbeat every 1 minute
- * Logs to console to prevent server sleep on free hosting platforms
+ * 404 Handler
  */
-setInterval(() => {
-    console.log(`🔄 Ping... [${new Date().toISOString()}]`);
-}, 60000); // 60,000 ms = 1 minute
+app.use((req, res) => {
+    res.status(404).json({
+        status: "not_found",
+        message: `${req.method} ${req.path} not found`,
+        available_endpoints: [
+            "POST /webhook",
+            "POST /webhook/signal",
+            "GET /get_signal",
+            "GET /health",
+            "GET /status",
+            "GET /"
+        ]
+    });
+});
 
-// Server startup logic
+// ==================== KEEP-ALIVE PING ====================
+setInterval(() => {
+    console.log(`🔄 [PING] Server alive at ${new Date().toISOString()}`);
+}, 60000); // Every 60 seconds
+
+// ==================== SERVER STARTUP ====================
 const startServer = () => {
     const hasSSL = fs.existsSync(SSL_CERT_PATH) && fs.existsSync(SSL_KEY_PATH);
     
@@ -187,12 +379,19 @@ const startServer = () => {
                 key: fs.readFileSync(SSL_KEY_PATH),
                 cert: fs.readFileSync(SSL_CERT_PATH)
             };
+            
             https.createServer(options, app).listen(PORT, HOST, () => {
-                console.log(`✅ HTTPS server on https://${HOST}:${PORT}`);
-                console.log(`🔥 Health endpoint active: /health`);
+                console.log(`\n${'='.repeat(60)}`);
+                console.log(`✅ HTTPS Webhook Server Started`);
+                console.log(`🔐 https://${HOST}:${PORT}`);
+                console.log(`📍 Main Endpoint: /webhook`);
+                console.log(`❤️  Health Check: /health`);
+                console.log(`📊 Status Page: /status`);
+                console.log(`${'='.repeat(60)}\n`);
             });
         } catch (err) {
             console.error(`⚠️  SSL Error: ${err.message}`);
+            console.log("Falling back to HTTP...\n");
             startHTTP();
         }
     } else {
@@ -202,13 +401,19 @@ const startServer = () => {
 
 const startHTTP = () => {
     app.listen(PORT, HOST, () => {
-        console.log(`⚠️  HTTP server on http://${HOST}:${PORT} (development only)`);
-        console.log(`📝 Place cert.pem and key.pem for HTTPS support`);
-        console.log(`🔥 Health endpoint active: /health`);
+        console.log(`\n${'='.repeat(60)}`);
+        console.log(`⚠️  HTTP Server Started (Development Only)`);
+        console.log(`🌐 http://${HOST}:${PORT}`);
+        console.log(`📝 For HTTPS, place cert.pem and key.pem in project root`);
+        console.log(`📍 Main Endpoint: /webhook`);
+        console.log(`❤️  Health Check: /health`);
+        console.log(`📊 Status Page: /status`);
+        console.log(`${'='.repeat(60)}\n`);
     });
 };
 
 // Start server
 startServer();
-console.log(`🔐 Webhook Secret Configured: ${!!process.env.WEBHOOK_SECRET_TOKEN}`);
-console.log(`⏰ Keep-alive ping active every 1 minute`);
+
+console.log(`🔑 Token Auth: ${process.env.WEBHOOK_SECRET_TOKEN ? 'Custom' : 'Default'}`);
+console.log(`⏰ Keep-alive: Active (60s interval)\n`);
