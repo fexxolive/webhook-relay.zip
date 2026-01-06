@@ -2,11 +2,19 @@
 //| WEBHOOK SERVER - v4.3 METHOD C (GET with URL Token)
 //| TradingView + MT5 EA Integration | Token in Query Parameter
 //| FIXED: user_id is now stored + returned to EA
+//| ADDON (No logic disturbed):
+//|   ✅ SQLite persistence for users + signals (no SheetDB)
+//|   ✅ Login/Admin APIs + signals list/delete APIs
 //+------------------------------------------------------------------+
 
 const express = require('express');
 const https = require('https');
 const fs = require('fs');
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+
+const { initDB, getDB } = require("./db");
+
 const app = express();
 
 // ==================== CONFIGURATION ====================
@@ -16,7 +24,11 @@ const PORT = process.env.PORT || 8443;
 const SSL_CERT_PATH = process.env.SSL_CERT_PATH || "cert.pem";
 const SSL_KEY_PATH = process.env.SSL_KEY_PATH || "key.pem";
 
+// Admin password (same as your frontend requirement)
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "1111";
+
 // ==================== MIDDLEWARE ====================
+app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -71,6 +83,27 @@ function logSignal(signal_obj) {
     }
 
     console.log("[SIGNAL-STORED] " + signal_obj.action + " | " + signal_obj.symbol + " | ID: " + signal_obj.id + " | USER: " + (signal_obj.user_id || "N/A"));
+
+    // ✅ ADDON: Persist to SQLite (non-blocking, no logic disturbed)
+    try {
+        const db = getDB();
+        if (db) {
+            db.run(
+                `INSERT INTO signals (signal, symbol, action, price, timeframe, user_id, tv_signal_id, received_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    signal_obj.signal,
+                    signal_obj.symbol,
+                    signal_obj.action,
+                    signal_obj.price || "",
+                    signal_obj.timeframe || "",
+                    signal_obj.user_id || "",
+                    signal_obj.id || "",
+                    new Date().toISOString()
+                ]
+            ).catch(() => {});
+        }
+    } catch (e) {}
 }
 
 function validateToken(req) {
@@ -105,6 +138,134 @@ function sanitizeUserId(str) {
 function generateSignalId() {
     return Date.now() + "_" + Math.random().toString(36).substr(2, 9);
 }
+
+// ==================== AUTH + DB APIs (NEW, does not disturb existing logic) ====================
+
+// ✅ Admin: create user (stores in SQLite)
+app.post("/api/admin/create-user", async (req, res) => {
+    try {
+        const body = req.body || {};
+        const admin_password = String(body.admin_password || "");
+        const name = String(body.name || "").trim();
+        const password = String(body.password || "");
+
+        if (admin_password !== ADMIN_PASSWORD) {
+            return res.status(401).json({ status: "unauthorized", message: "Invalid admin password" });
+        }
+        if (!name || !password) {
+            return res.status(400).json({ status: "bad_request", message: "name and password required" });
+        }
+
+        // Rule: Admin types "Asheen" -> system stores "user_Asheen"
+        const user_id = "user_" + name;
+        const password_hash = await bcrypt.hash(password, 10);
+
+        const db = getDB();
+        await db.run(
+            `INSERT INTO users (user_id, password_hash, created_at) VALUES (?, ?, ?)`,
+            [user_id, password_hash, new Date().toISOString()]
+        );
+
+        return res.status(200).json({ status: "ok", user_id });
+    } catch (e) {
+        const msg = String(e.message || "");
+        if (msg.includes("UNIQUE")) {
+            return res.status(409).json({ status: "exists", message: "User already exists" });
+        }
+        return res.status(500).json({ status: "error", message: msg });
+    }
+});
+
+// ✅ User login
+app.post("/api/login", async (req, res) => {
+    try {
+        const body = req.body || {};
+        const user_id = sanitizeUserId(body.user_id || "");
+        const password = String(body.password || "");
+
+        if (!user_id || !password) {
+            return res.status(400).json({ status: "bad_request", message: "user_id and password required" });
+        }
+
+        const db = getDB();
+        const row = await db.get(`SELECT user_id, password_hash FROM users WHERE user_id = ?`, [user_id]);
+
+        if (!row) {
+            return res.status(404).json({ status: "not_found", message: "User not found" });
+        }
+
+        const ok = await bcrypt.compare(password, row.password_hash);
+        if (!ok) {
+            return res.status(401).json({ status: "unauthorized", message: "Invalid password" });
+        }
+
+        return res.status(200).json({ status: "ok", user_id: row.user_id });
+    } catch (e) {
+        return res.status(500).json({ status: "error", message: String(e.message || "") });
+    }
+});
+
+// ✅ List signals (per user)
+app.get("/api/signals", async (req, res) => {
+    try {
+        const user_id = sanitizeUserId(req.query.user_id || "");
+        const limit = Math.min(parseInt(req.query.limit || "500", 10) || 500, 2000);
+
+        if (!user_id) {
+            return res.status(400).json({ status: "bad_request", message: "user_id required" });
+        }
+
+        const db = getDB();
+        const rows = await db.all(
+            `SELECT id, signal, symbol, action, price, timeframe, user_id, tv_signal_id, received_at
+             FROM signals
+             WHERE user_id = ?
+             ORDER BY id DESC
+             LIMIT ?`,
+            [user_id, limit]
+        );
+
+        return res.status(200).json({ status: "ok", signals: rows });
+    } catch (e) {
+        return res.status(500).json({ status: "error", message: String(e.message || "") });
+    }
+});
+
+// ✅ Delete one signal (per user safety)
+app.delete("/api/signals/:id", async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        const user_id = sanitizeUserId(req.query.user_id || "");
+
+        if (!id || !user_id) {
+            return res.status(400).json({ status: "bad_request", message: "id and user_id required" });
+        }
+
+        const db = getDB();
+        const result = await db.run(`DELETE FROM signals WHERE id = ? AND user_id = ?`, [id, user_id]);
+
+        return res.status(200).json({ status: "ok", deleted: result.changes || 0 });
+    } catch (e) {
+        return res.status(500).json({ status: "error", message: String(e.message || "") });
+    }
+});
+
+// ✅ Delete all signals for user (optional helper)
+app.delete("/api/signals", async (req, res) => {
+    try {
+        const user_id = sanitizeUserId(req.query.user_id || "");
+        if (!user_id) {
+            return res.status(400).json({ status: "bad_request", message: "user_id required" });
+        }
+
+        const db = getDB();
+        const result = await db.run(`DELETE FROM signals WHERE user_id = ?`, [user_id]);
+
+        return res.status(200).json({ status: "ok", deleted: result.changes || 0 });
+    } catch (e) {
+        return res.status(500).json({ status: "error", message: String(e.message || "") });
+    }
+});
 
 // ==================== MAIN GET ENDPOINT (METHOD C) ====================
 
@@ -425,12 +586,17 @@ app.get("/", (req, res) => {
             "GET /get_signal?token=TOKEN": "Primary MT5 signal endpoint (Method C)",
             "GET /signal?token=TOKEN": "Alternative signal endpoint",
             "POST /webhook": "TradingView alerts (token in body)",
+            "POST /api/admin/create-user": "Admin creates users (SQLite)",
+            "POST /api/login": "User login (SQLite)",
+            "GET /api/signals?user_id=...": "List signals for user (SQLite)",
+            "DELETE /api/signals/:id?user_id=...": "Delete single signal (SQLite)",
+            "DELETE /api/signals?user_id=...": "Delete all signals for user (SQLite)",
             "GET /health": "Health check",
             "GET /status": "Detailed status",
             "GET /": "This page"
         },
         usage: {
-            "MT5 EA Call": "GET /get_signal?token=37ehADKNLy5psq1IvdUDYshxxik_zuy2RYD72n7E858DYqR2",
+            "MT5 EA Call": "GET /get_signal?token=YOUR_TOKEN",
             "TradingView Webhook": "POST /webhook with body containing token + user_id"
         },
         pending_signal: latest_signal.signal !== 0,
@@ -448,6 +614,11 @@ app.use((req, res) => {
             "GET /get_signal?token=TOKEN",
             "GET /signal?token=TOKEN",
             "POST /webhook",
+            "POST /api/admin/create-user",
+            "POST /api/login",
+            "GET /api/signals?user_id=...",
+            "DELETE /api/signals/:id?user_id=...",
+            "DELETE /api/signals?user_id=...",
             "GET /health",
             "GET /status",
             "GET /"
@@ -501,6 +672,7 @@ function startServer() {
                 console.log("  Body: {\"event\":\"ALERT\",\"symbol\":\"XAUUSD\",\"action\":\"BUY\",\"token\":\"...\",\"user_id\":\"user_Asheen\"}");
                 console.log("");
                 console.log("Token (first 25 chars): " + SECRET_TOKEN.substring(0, 25) + "...");
+                console.log("Admin password: " + ADMIN_PASSWORD);
                 console.log(sep);
                 console.log("Ready for MT5 EA and TradingView signals");
                 console.log("");
@@ -528,6 +700,7 @@ function startHTTP() {
         console.log("ENDPOINT:");
         console.log("  http://localhost:" + PORT + "/get_signal?token=YOUR_TOKEN");
         console.log("");
+        console.log("Admin password: " + ADMIN_PASSWORD);
         console.log("Note: For production, add cert.pem and key.pem");
         console.log(sep);
         console.log("Ready for signals");
@@ -535,4 +708,13 @@ function startHTTP() {
     });
 }
 
-startServer();
+// ✅ DB init first, then start server (no logic disturbed)
+(async () => {
+    try {
+        await initDB();
+        startServer();
+    } catch (e) {
+        console.error("DB INIT FAILED:", e.message);
+        process.exit(1);
+    }
+})();
