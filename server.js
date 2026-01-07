@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
-//| WEBHOOK SERVER - v4.3 METHOD C (GET with URL Token)
+//| WEBHOOK SERVER - v4.3 USER-WISE STORE (FIX A)
 //| TradingView + MT5 EA Integration | Token in Query Parameter
-//| FIXED: user_id is now stored + returned to EA
+//| FIXED: Signals are stored per-user_id so multi EA can't steal signals
 //+------------------------------------------------------------------+
 
 const express = require('express');
@@ -39,17 +39,23 @@ app.use((err, req, res, next) => {
     });
 });
 
-// ==================== SIGNAL STORAGE ====================
-let latest_signal = {
-    signal: 0,
-    symbol: "",
-    timestamp: null,
-    action: "",
-    id: "",
-    price: "",
-    timeframe: "",
-    user_id: ""          // ✅ ADDED
-};
+// ==================== SIGNAL STORAGE (PER USER) ====================
+
+function emptySignal() {
+    return {
+        signal: 0,
+        symbol: "",
+        timestamp: null,
+        action: "",
+        id: "",
+        price: "",
+        timeframe: "",
+        user_id: ""
+    };
+}
+
+// ✅ per-user latest signals
+const latest_signal_by_user = Object.create(null); // { "user_Asheen": {...}, "user_Ameen": {...} }
 
 const signal_history = [];
 const MAX_HISTORY = 50;
@@ -62,7 +68,7 @@ function logSignal(signal_obj) {
         symbol: signal_obj.symbol,
         action: signal_obj.action,
         id: signal_obj.id,
-        user_id: signal_obj.user_id || "",     // ✅ ADDED
+        user_id: signal_obj.user_id || "",
         receivedAt: new Date().toISOString()
     });
 
@@ -106,12 +112,20 @@ function generateSignalId() {
     return Date.now() + "_" + Math.random().toString(36).substr(2, 9);
 }
 
+function hasPendingAnyUser() {
+    return Object.keys(latest_signal_by_user).some(uid => latest_signal_by_user[uid] && latest_signal_by_user[uid].signal !== 0);
+}
+
+function getPendingUsers() {
+    return Object.keys(latest_signal_by_user).filter(uid => latest_signal_by_user[uid] && latest_signal_by_user[uid].signal !== 0);
+}
+
 // ==================== MAIN GET ENDPOINT (METHOD C) ====================
 
 /**
  * GET /get_signal
- * MT5 EA retrieves signals using: /get_signal?token=YOUR_TOKEN
- * This is the PRIMARY endpoint for Method C
+ * MT5 EA retrieves signals using:
+ * /get_signal?token=YOUR_TOKEN&user_id=user_Asheen
  */
 app.get("/get_signal", (req, res) => {
     console.log("  GET /get_signal endpoint called (METHOD C)");
@@ -122,37 +136,39 @@ app.get("/get_signal", (req, res) => {
         return res.status(401).json({
             status: "unauthorized",
             message: "Invalid or missing token in URL",
-            example: "/get_signal?token=YOUR_TOKEN_HERE",
+            example: "/get_signal?token=YOUR_TOKEN_HERE&user_id=user_Asheen",
             timestamp: new Date().toISOString()
         });
     }
 
-    console.log("  Token accepted - checking for pending signals");
+    // ✅ REQUIRED: user_id for multi-user safety
+    const requested_user_id = sanitizeUserId(req.query.user_id || "");
+    if (!requested_user_id) {
+        console.log("  Missing user_id in query - returning no_signal (safe)");
+        return res.status(200).json({
+            status: "no_signal",
+            signal: 0,
+            symbol: "",
+            id: ""
+        });
+    }
 
-    // Signal available
-    if (latest_signal.signal !== 0) {
-        const signal_to_send = {
-            signal: latest_signal.signal,
-            symbol: latest_signal.symbol,
-            action: latest_signal.action,
-            timestamp: latest_signal.timestamp,
-            id: latest_signal.id,
-            price: latest_signal.price,
-            timeframe: latest_signal.timeframe,
-            user_id: latest_signal.user_id || ""   // ✅ ADDED
-        };
+    if (!latest_signal_by_user[requested_user_id]) {
+        latest_signal_by_user[requested_user_id] = emptySignal();
+    }
 
-        console.log("  SIGNAL FOUND - Sending: " + latest_signal.action + " " + latest_signal.symbol + " | USER: " + (latest_signal.user_id || "N/A"));
-        console.log("  Resetting signal to prevent duplicate trades");
+    const bucket = latest_signal_by_user[requested_user_id];
 
-        // Reset signal after retrieval
-        latest_signal.signal = 0;
-        latest_signal.symbol = "";
-        latest_signal.action = "";
-        latest_signal.id = "";
-        latest_signal.price = "";
-        latest_signal.timeframe = "";
-        latest_signal.user_id = "";               // ✅ ADDED
+    console.log("  Token accepted - checking for pending signals for USER: " + requested_user_id);
+
+    if (bucket.signal !== 0) {
+        const signal_to_send = { ...bucket };
+
+        console.log("  SIGNAL FOUND - Sending: " + signal_to_send.action + " " + signal_to_send.symbol + " | USER: " + requested_user_id);
+        console.log("  Resetting ONLY this user's signal to prevent duplicates");
+
+        // ✅ Reset only this user's signal after retrieval
+        latest_signal_by_user[requested_user_id] = emptySignal();
 
         return res.status(200).json({
             status: "ok",
@@ -163,12 +179,11 @@ app.get("/get_signal", (req, res) => {
             id: signal_to_send.id,
             price: signal_to_send.price,
             timeframe: signal_to_send.timeframe,
-            user_id: signal_to_send.user_id        // ✅ ADDED
+            user_id: signal_to_send.user_id
         });
     }
 
-    // No signal available
-    console.log("  No signal available - responding with no_signal");
+    console.log("  No signal available for this user - responding with no_signal");
     return res.status(200).json({
         status: "no_signal",
         signal: 0,
@@ -182,7 +197,6 @@ app.get("/get_signal", (req, res) => {
 /**
  * POST /webhook
  * TradingView sends alerts here
- * Format: POST with token in body:
  * {"event":"ALERT","symbol":"XAUUSD","action":"BUY","token":"YOUR_TOKEN","user_id":"user_Asheen"}
  */
 app.post("/webhook", (req, res) => {
@@ -208,19 +222,30 @@ app.post("/webhook", (req, res) => {
             });
         }
 
-        if (latest_signal.signal !== 0) {
-            const signal_to_send = {
-                signal: latest_signal.signal,
-                symbol: latest_signal.symbol,
-                action: latest_signal.action,
-                timestamp: latest_signal.timestamp,
-                id: latest_signal.id,
-                user_id: latest_signal.user_id || ""   // ✅ ADDED
-            };
+        // ✅ Required for multi-user safety
+        const requested_user_id = sanitizeUserId(body.user_id || "");
+        if (!requested_user_id) {
+            console.log("  Missing user_id in POST GET_SIGNAL - returning no_signal");
+            return res.status(200).json({
+                status: "no_signal",
+                signal: 0,
+                id: ""
+            });
+        }
 
-            console.log("  SIGNAL SENT: " + latest_signal.action + " " + latest_signal.symbol + " | USER: " + (latest_signal.user_id || "N/A"));
-            latest_signal.signal = 0;
-            latest_signal.user_id = "";               // ✅ ADDED
+        if (!latest_signal_by_user[requested_user_id]) {
+            latest_signal_by_user[requested_user_id] = emptySignal();
+        }
+
+        const bucket = latest_signal_by_user[requested_user_id];
+
+        if (bucket.signal !== 0) {
+            const signal_to_send = { ...bucket };
+
+            console.log("  SIGNAL SENT: " + signal_to_send.action + " " + signal_to_send.symbol + " | USER: " + requested_user_id);
+
+            // ✅ consume only this user's signal
+            latest_signal_by_user[requested_user_id] = emptySignal();
 
             return res.status(200).json({
                 status: "ok",
@@ -229,11 +254,11 @@ app.post("/webhook", (req, res) => {
                 action: signal_to_send.action,
                 timestamp: signal_to_send.timestamp,
                 id: signal_to_send.id,
-                user_id: signal_to_send.user_id        // ✅ ADDED
+                user_id: signal_to_send.user_id
             });
         }
 
-        console.log("  No signal available");
+        console.log("  No signal available for this user");
         return res.status(200).json({
             status: "no_signal",
             signal: 0,
@@ -259,7 +284,7 @@ app.post("/webhook", (req, res) => {
         const action = sanitize(body.action || body.signal || "");
         const price = body.price || "";
         const timeframe = body.timeframe || "";
-        const user_id = sanitizeUserId(body.user_id || "");   // ✅ ADDED
+        const user_id = sanitizeUserId(body.user_id || "");
 
         // Validate symbol
         if (!symbol) {
@@ -279,7 +304,7 @@ app.post("/webhook", (req, res) => {
             });
         }
 
-        // ✅ Validate user_id (required for your multi-user system)
+        // Validate user_id
         if (!user_id) {
             console.log("  Missing user_id");
             return res.status(400).json({
@@ -288,11 +313,11 @@ app.post("/webhook", (req, res) => {
             });
         }
 
-        // Store signal
+        // Store signal per-user
         const numeric_signal = action === "BUY" ? 1 : -1;
         const signal_id = generateSignalId();
 
-        latest_signal = {
+        latest_signal_by_user[user_id] = {
             signal: numeric_signal,
             symbol: symbol,
             action: action,
@@ -300,20 +325,19 @@ app.post("/webhook", (req, res) => {
             id: signal_id,
             price: price,
             timeframe: timeframe,
-            user_id: user_id          // ✅ ADDED
+            user_id: user_id
         };
 
-        logSignal(latest_signal);
-        console.log("  ALERT STORED: " + action + " " + symbol + " | USER: " + user_id + " at " + price + " (" + timeframe + ")");
-        console.log("  EA will retrieve on next /get_signal?token=... call");
+        logSignal(latest_signal_by_user[user_id]);
+        console.log("  ALERT STORED (PER USER): " + action + " " + symbol + " | USER: " + user_id + " at " + price + " (" + timeframe + ")");
 
         return res.status(200).json({
             status: "ok",
-            message: "Alert received and stored",
+            message: "Alert received and stored (per-user)",
             signal: numeric_signal,
             id: signal_id,
             symbol: symbol,
-            user_id: user_id,   // ✅ ADDED
+            user_id: user_id,
             timestamp: new Date().toISOString()
         });
     }
@@ -339,6 +363,10 @@ app.post("/webhook", (req, res) => {
 
 // ==================== ALTERNATIVE ENDPOINTS ====================
 
+/**
+ * GET /signal?token=TOKEN&user_id=user_Asheen
+ * (kept for compatibility)
+ */
 app.get("/signal", (req, res) => {
     console.log("  GET /signal endpoint called");
 
@@ -349,21 +377,26 @@ app.get("/signal", (req, res) => {
         });
     }
 
-    if (latest_signal.signal !== 0) {
-        const signal_to_send = {
-            signal: latest_signal.signal,
-            symbol: latest_signal.symbol,
-            action: latest_signal.action,
-            timestamp: latest_signal.timestamp,
-            id: latest_signal.id,
-            price: latest_signal.price,
-            timeframe: latest_signal.timeframe,
-            user_id: latest_signal.user_id || ""   // ✅ ADDED
-        };
+    const requested_user_id = sanitizeUserId(req.query.user_id || "");
+    if (!requested_user_id) {
+        return res.status(200).json({
+            status: "no_signal",
+            signal: 0,
+            id: ""
+        });
+    }
 
-        latest_signal.signal = 0;
-        latest_signal.user_id = "";               // ✅ ADDED
-        console.log("  Signal sent: " + signal_to_send.action);
+    if (!latest_signal_by_user[requested_user_id]) {
+        latest_signal_by_user[requested_user_id] = emptySignal();
+    }
+
+    const bucket = latest_signal_by_user[requested_user_id];
+
+    if (bucket.signal !== 0) {
+        const signal_to_send = { ...bucket };
+
+        latest_signal_by_user[requested_user_id] = emptySignal();
+        console.log("  Signal sent: " + signal_to_send.action + " | USER: " + requested_user_id);
 
         return res.status(200).json({
             status: "ok",
@@ -374,7 +407,7 @@ app.get("/signal", (req, res) => {
             id: signal_to_send.id,
             price: signal_to_send.price,
             timeframe: signal_to_send.timeframe,
-            user_id: signal_to_send.user_id        // ✅ ADDED
+            user_id: signal_to_send.user_id
         });
     }
 
@@ -392,7 +425,7 @@ app.get("/health", (req, res) => {
         status: "healthy",
         uptime: process.uptime(),
         timestamp: new Date().toISOString(),
-        pending_signal: latest_signal.signal !== 0
+        pending_signal: hasPendingAnyUser()
     });
 });
 
@@ -405,11 +438,11 @@ app.get("/status", (req, res) => {
         status: "running",
         uptime: process.uptime(),
         timestamp: new Date().toISOString(),
-        latest_signal: latest_signal,
-        pending_signal: latest_signal.signal !== 0 ? "YES" : "NO",
+        pending_users: getPendingUsers(),
+        latest_signal_by_user: latest_signal_by_user,
         recent_history: recentHistory,
         total_signals_processed: signal_history.length,
-        server_version: "4.3"
+        server_version: "4.3-userwise"
     });
 });
 
@@ -418,22 +451,22 @@ app.get("/", (req, res) => {
 
     res.status(200).json({
         status: "running",
-        version: "4.3",
-        method: "C - Token in URL Query Parameter",
+        version: "4.3-userwise",
+        method: "C - Token in URL Query Parameter (User-wise store)",
         protocol: hasSSL ? "HTTPS" : "HTTP",
         endpoints: {
-            "GET /get_signal?token=TOKEN": "Primary MT5 signal endpoint (Method C)",
-            "GET /signal?token=TOKEN": "Alternative signal endpoint",
+            "GET /get_signal?token=TOKEN&user_id=user_Asheen": "Primary MT5 signal endpoint (User-wise)",
+            "GET /signal?token=TOKEN&user_id=user_Asheen": "Alternative signal endpoint (User-wise)",
             "POST /webhook": "TradingView alerts (token in body)",
             "GET /health": "Health check",
             "GET /status": "Detailed status",
             "GET /": "This page"
         },
         usage: {
-            "MT5 EA Call": "GET /get_signal?token=37ehADKNLy5psq1IvdUDYshxxik_zuy2RYD72n7E858DYqR2",
+            "MT5 EA Call": "GET /get_signal?token=YOUR_TOKEN&user_id=user_Asheen",
             "TradingView Webhook": "POST /webhook with body containing token + user_id"
         },
-        pending_signal: latest_signal.signal !== 0,
+        pending_signal: hasPendingAnyUser(),
         timestamp: new Date().toISOString()
     });
 });
@@ -445,8 +478,8 @@ app.use((req, res) => {
         status: "not_found",
         message: req.method + " " + req.path + " not found",
         available_endpoints: [
-            "GET /get_signal?token=TOKEN",
-            "GET /signal?token=TOKEN",
+            "GET /get_signal?token=TOKEN&user_id=user_Asheen",
+            "GET /signal?token=TOKEN&user_id=user_Asheen",
             "POST /webhook",
             "GET /health",
             "GET /status",
@@ -459,8 +492,8 @@ app.use((req, res) => {
 // ==================== HEARTBEAT ====================
 setInterval(() => {
     const timestamp = new Date().toISOString();
-    const pending = latest_signal.signal !== 0 ? "YES" : "NO";
-    console.log("[HEARTBEAT] " + timestamp + " | Pending Signal: " + pending);
+    const pending_users = getPendingUsers();
+    console.log("[HEARTBEAT] " + timestamp + " | Pending Users: " + pending_users.length + (pending_users.length ? " => " + pending_users.join(",") : ""));
 }, 30000);
 
 // ==================== ERROR HANDLING ====================
@@ -487,14 +520,14 @@ function startServer() {
                 const sep = "=========================================================================";
                 console.log("");
                 console.log(sep);
-                console.log("WEBHOOK SERVER v4.3 - METHOD C (Token in URL)");
+                console.log("WEBHOOK SERVER v4.3 USER-WISE (Token in URL)");
                 console.log(sep);
                 console.log("Protocol:     HTTPS (Secure)");
                 console.log("Host:         " + HOST);
                 console.log("Port:         " + PORT);
                 console.log("");
                 console.log("PRIMARY ENDPOINT (MT5):");
-                console.log("  https://webhook-relay-zip.onrender.com/get_signal?token=YOUR_TOKEN");
+                console.log("  https://webhook-relay-zip.onrender.com/get_signal?token=YOUR_TOKEN&user_id=user_Asheen");
                 console.log("");
                 console.log("TRADINGVIEW ENDPOINT:");
                 console.log("  POST https://webhook-relay-zip.onrender.com/webhook");
@@ -502,7 +535,7 @@ function startServer() {
                 console.log("");
                 console.log("Token (first 25 chars): " + SECRET_TOKEN.substring(0, 25) + "...");
                 console.log(sep);
-                console.log("Ready for MT5 EA and TradingView signals");
+                console.log("Ready for MT5 EA and TradingView signals (multi-user safe)");
                 console.log("");
             });
         } catch (err) {
@@ -519,18 +552,18 @@ function startHTTP() {
         const sep = "=========================================================================";
         console.log("");
         console.log(sep);
-        console.log("WEBHOOK SERVER v4.3 - METHOD C (Token in URL)");
+        console.log("WEBHOOK SERVER v4.3 USER-WISE (Token in URL)");
         console.log(sep);
         console.log("Protocol:     HTTP (Development)");
         console.log("Host:         " + HOST);
         console.log("Port:         " + PORT);
         console.log("");
         console.log("ENDPOINT:");
-        console.log("  http://localhost:" + PORT + "/get_signal?token=YOUR_TOKEN");
+        console.log("  http://localhost:" + PORT + "/get_signal?token=YOUR_TOKEN&user_id=user_Asheen");
         console.log("");
         console.log("Note: For production, add cert.pem and key.pem");
         console.log(sep);
-        console.log("Ready for signals");
+        console.log("Ready for signals (multi-user safe)");
         console.log("");
     });
 }
