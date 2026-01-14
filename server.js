@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
-//| WEBHOOK SERVER - v4.3 USER-WISE STORE (FIX A)
+//| WEBHOOK SERVER - v4.3 USER-WISE STORE + BROADCAST (FIX B)
 //| TradingView + MT5 EA Integration | Token in Query Parameter
 //| FIXED: Signals are stored per-user_id so multi EA can't steal signals
+//| NEW: 1 TradingView alert can broadcast to multiple user_ids via user_ids[]
 //+------------------------------------------------------------------+
 
 const express = require('express');
@@ -197,7 +198,11 @@ app.get("/get_signal", (req, res) => {
 /**
  * POST /webhook
  * TradingView sends alerts here
+ * Single user (old):
  * {"event":"ALERT","symbol":"XAUUSD","action":"BUY","token":"YOUR_TOKEN","user_id":"user_Asheen"}
+ *
+ * Multi-user broadcast (new):
+ * {"event":"ALERT","symbol":"XAUUSD","action":"BUY","token":"YOUR_TOKEN","user_ids":["user_Asheen","user_Sofia"]}
  */
 app.post("/webhook", (req, res) => {
     console.log("  POST /webhook endpoint called");
@@ -284,7 +289,6 @@ app.post("/webhook", (req, res) => {
         const action = sanitize(body.action || body.signal || "");
         const price = body.price || "";
         const timeframe = body.timeframe || "";
-        const user_id = sanitizeUserId(body.user_id || "");
 
         // Validate symbol
         if (!symbol) {
@@ -304,40 +308,56 @@ app.post("/webhook", (req, res) => {
             });
         }
 
-        // Validate user_id
-        if (!user_id) {
-            console.log("  Missing user_id");
+        // ✅ NEW: Resolve targets (multi-user broadcast supported)
+        let targets = [];
+
+        // 1) New format: user_ids[]
+        if (Array.isArray(body.user_ids) && body.user_ids.length > 0) {
+            targets = body.user_ids.map(sanitizeUserId).filter(Boolean);
+        }
+
+        // 2) Backward compatible: single user_id
+        if (targets.length === 0) {
+            const single = sanitizeUserId(body.user_id || "");
+            if (single) targets = [single];
+        }
+
+        // Validate targets
+        if (targets.length === 0) {
+            console.log("  Missing user_id / user_ids");
             return res.status(400).json({
                 status: "bad_request",
-                message: "user_id is required (e.g. user_Asheen)"
+                message: "user_id is required (old) OR user_ids[] is required (broadcast)"
             });
         }
 
-        // Store signal per-user
+        // Store signal per-user (broadcast)
         const numeric_signal = action === "BUY" ? 1 : -1;
         const signal_id = generateSignalId();
 
-        latest_signal_by_user[user_id] = {
-            signal: numeric_signal,
-            symbol: symbol,
-            action: action,
-            timestamp: new Date().toISOString(),
-            id: signal_id,
-            price: price,
-            timeframe: timeframe,
-            user_id: user_id
-        };
+        targets.forEach((uid) => {
+            latest_signal_by_user[uid] = {
+                signal: numeric_signal,
+                symbol: symbol,
+                action: action,
+                timestamp: new Date().toISOString(),
+                id: signal_id, // same id for all targets
+                price: price,
+                timeframe: timeframe,
+                user_id: uid
+            };
 
-        logSignal(latest_signal_by_user[user_id]);
-        console.log("  ALERT STORED (PER USER): " + action + " " + symbol + " | USER: " + user_id + " at " + price + " (" + timeframe + ")");
+            logSignal(latest_signal_by_user[uid]);
+            console.log("  ALERT STORED (BROADCAST): " + action + " " + symbol + " | USER: " + uid + " at " + price + " (" + timeframe + ")");
+        });
 
         return res.status(200).json({
             status: "ok",
-            message: "Alert received and stored (per-user)",
+            message: "Alert received and stored (broadcast)",
             signal: numeric_signal,
             id: signal_id,
             symbol: symbol,
-            user_id: user_id,
+            targets: targets,
             timestamp: new Date().toISOString()
         });
     }
@@ -442,7 +462,7 @@ app.get("/status", (req, res) => {
         latest_signal_by_user: latest_signal_by_user,
         recent_history: recentHistory,
         total_signals_processed: signal_history.length,
-        server_version: "4.3-userwise"
+        server_version: "4.3-userwise-broadcast"
     });
 });
 
@@ -451,20 +471,21 @@ app.get("/", (req, res) => {
 
     res.status(200).json({
         status: "running",
-        version: "4.3-userwise",
-        method: "C - Token in URL Query Parameter (User-wise store)",
+        version: "4.3-userwise-broadcast",
+        method: "C - Token in URL Query Parameter (User-wise store + Broadcast)",
         protocol: hasSSL ? "HTTPS" : "HTTP",
         endpoints: {
             "GET /get_signal?token=TOKEN&user_id=user_Asheen": "Primary MT5 signal endpoint (User-wise)",
             "GET /signal?token=TOKEN&user_id=user_Asheen": "Alternative signal endpoint (User-wise)",
-            "POST /webhook": "TradingView alerts (token in body)",
+            "POST /webhook": "TradingView alerts (token in body) | supports user_id or user_ids[]",
             "GET /health": "Health check",
             "GET /status": "Detailed status",
             "GET /": "This page"
         },
         usage: {
             "MT5 EA Call": "GET /get_signal?token=YOUR_TOKEN&user_id=user_Asheen",
-            "TradingView Webhook": "POST /webhook with body containing token + user_id"
+            "TradingView Webhook (single)": "POST /webhook with body containing token + user_id",
+            "TradingView Webhook (broadcast)": "POST /webhook with body containing token + user_ids[]"
         },
         pending_signal: hasPendingAnyUser(),
         timestamp: new Date().toISOString()
@@ -520,7 +541,7 @@ function startServer() {
                 const sep = "=========================================================================";
                 console.log("");
                 console.log(sep);
-                console.log("WEBHOOK SERVER v4.3 USER-WISE (Token in URL)");
+                console.log("WEBHOOK SERVER v4.3 USER-WISE + BROADCAST (Token in URL)");
                 console.log(sep);
                 console.log("Protocol:     HTTPS (Secure)");
                 console.log("Host:         " + HOST);
@@ -531,11 +552,12 @@ function startServer() {
                 console.log("");
                 console.log("TRADINGVIEW ENDPOINT:");
                 console.log("  POST https://webhook-relay-zip.onrender.com/webhook");
-                console.log("  Body: {\"event\":\"ALERT\",\"symbol\":\"XAUUSD\",\"action\":\"BUY\",\"token\":\"...\",\"user_id\":\"user_Asheen\"}");
+                console.log("  Body (single):    {\"event\":\"ALERT\",\"symbol\":\"XAUUSD\",\"action\":\"BUY\",\"token\":\"...\",\"user_id\":\"user_Asheen\"}");
+                console.log("  Body (broadcast): {\"event\":\"ALERT\",\"symbol\":\"XAUUSD\",\"action\":\"BUY\",\"token\":\"...\",\"user_ids\":[\"user_Asheen\",\"user_Sofia\"]}");
                 console.log("");
                 console.log("Token (first 25 chars): " + SECRET_TOKEN.substring(0, 25) + "...");
                 console.log(sep);
-                console.log("Ready for MT5 EA and TradingView signals (multi-user safe)");
+                console.log("Ready for MT5 EA and TradingView signals (multi-user safe + broadcast)");
                 console.log("");
             });
         } catch (err) {
@@ -552,7 +574,7 @@ function startHTTP() {
         const sep = "=========================================================================";
         console.log("");
         console.log(sep);
-        console.log("WEBHOOK SERVER v4.3 USER-WISE (Token in URL)");
+        console.log("WEBHOOK SERVER v4.3 USER-WISE + BROADCAST (Token in URL)");
         console.log(sep);
         console.log("Protocol:     HTTP (Development)");
         console.log("Host:         " + HOST);
@@ -563,7 +585,7 @@ function startHTTP() {
         console.log("");
         console.log("Note: For production, add cert.pem and key.pem");
         console.log(sep);
-        console.log("Ready for signals (multi-user safe)");
+        console.log("Ready for signals (multi-user safe + broadcast)");
         console.log("");
     });
 }
