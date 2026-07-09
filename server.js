@@ -1,13 +1,18 @@
 //+------------------------------------------------------------------+
-//| WEBHOOK SERVER - v4.6 QUEUE-BASED + SL_RAW + WINDOWS SUPPORT
+//| WEBHOOK SERVER - v4.7 QUEUE-BASED + SL_RAW + WINDOWS + USER-SCOPED
 //| TradingView + MT5 EA Integration | Token in Query Parameter
 //| FIX v4.5: Signal QUEUE per user — multiple alerts same second pe
 //|           koi signal miss/overwrite nahi hoga
 //| FIX v4.6: /get_windows endpoint added + WINDOWS_UPDATE event
 //|           handling — Pine scripts ka hourly window-schedule alert
 //|           ab STORE hota hai aur EA usse poll karke fetch kar sakta
-//|           hai. Pehle ye missing tha, isliye EA kabhi live windows
-//|           populate nahi kar pata tha (silent dead system).
+//|           hai.
+//| FIX v4.7 (NEW): Windows ab per-user_id SCOPED hain. Pine script se
+//|           aane wale WINDOWS_UPDATE ke saath user_ids[] store hota
+//|           hai. EA ab /get_windows call karte waqt apna user_id
+//|           bhejta hai — server sirf tabhi windows deta hai jab wo
+//|           user_id us group ki allowed list mein ho. Isse koi bhi
+//|           EA "kisi aur ka" user_id / windows fetch nahi kar payega.
 //| PRESERVED: sl_raw field — TradingView sends {{low}} or {{high}}
 //|            EA calculates final SL using wickPercent + slBuffer inputs
 //+------------------------------------------------------------------+
@@ -61,16 +66,19 @@ const signal_history = [];
 const MAX_HISTORY = 50;
 const MAX_QUEUE_PER_USER = 20; // safety cap
 
-// ==================== WINDOWS STORAGE (NEW in v4.6) ====================
+// ==================== WINDOWS STORAGE (v4.6, now user-scoped in v4.7) ====================
 // Pine scripts (Group A / Group B) har hour "WINDOWS_UPDATE" event bhejte
 // hain jisme us group ke qualifying time-windows (numeric, full-day)
-// hote hain. Ye yahan group-wise store hote hain, aur EA GET /get_windows
-// se poll karke fetch karta hai. Shape EA ke ParseWindowsJson() se match:
+// hote hain, saath mein user_ids[] jinke liye ye windows valid hain.
+// Ye yahan group-wise store hote hain, aur EA GET /get_windows se
+// apna user_id bhejke poll karta hai. Server sirf tabhi windows
+// return karta hai jab requesting user_id allowed_user_ids mein ho.
+// Shape EA ke ParseWindowsJson() se match:
 //   {"windows":[{"start_h":X,"start_m":Y,"end_h":Z,"end_m":W,"winrate":P}, ...]}
 
 const windowsByGroup = {
-    A: { windows: [], active_windows: "", symbol: "", timeframe: "", min_accuracy: "", updatedAt: null },
-    B: { windows: [], active_windows: "", symbol: "", timeframe: "", min_accuracy: "", updatedAt: null }
+    A: { windows: [], active_windows: "", symbol: "", timeframe: "", min_accuracy: "", allowed_user_ids: [], updatedAt: null },
+    B: { windows: [], active_windows: "", symbol: "", timeframe: "", min_accuracy: "", allowed_user_ids: [], updatedAt: null }
 };
 
 function isValidGroup(g) {
@@ -107,17 +115,28 @@ function storeWindowsUpdate(body) {
 
     const cleanWindows = sanitizeWindowsArray(body.windows);
 
+    // ✅ FIX v4.7: user_ids jinke liye ye windows valid hain.
+    // Agar body mein user_ids nahi bheja gaya (ya empty hai), allowed
+    // list empty rehti hai — is case mein /get_windows koi bhi user_id
+    // ko allow NAHI karega (fail-closed), taaki purana "sabko sab kuch
+    // mil jaana" wala gap dobara na khule.
+    const allowedUserIds = Array.isArray(body.user_ids)
+        ? body.user_ids.map(sanitizeUserId).filter(Boolean)
+        : [];
+
     windowsByGroup[group] = {
         windows: cleanWindows,
         active_windows: typeof body.active_windows === "string" ? body.active_windows : "",
         symbol: typeof body.symbol === "string" ? body.symbol : "",
         timeframe: typeof body.timeframe === "string" ? body.timeframe : "",
         min_accuracy: typeof body.min_accuracy === "string" ? body.min_accuracy : "",
+        allowed_user_ids: allowedUserIds,   // ✅ NEW in v4.7
         updatedAt: new Date().toISOString()
     };
 
     console.log("  WINDOWS_UPDATE stored | Group " + group + " | " +
-        cleanWindows.length + " window(s) | symbol=" + windowsByGroup[group].symbol +
+        cleanWindows.length + " window(s) | allowed_users=[" + allowedUserIds.join(", ") + "]" +
+        " | symbol=" + windowsByGroup[group].symbol +
         " | active=" + (windowsByGroup[group].active_windows || "none right now"));
 
     return { ok: true, group, count: cleanWindows.length };
@@ -131,6 +150,7 @@ function windowsFeedStatus() {
         const updatedAtMs = entry.updatedAt ? new Date(entry.updatedAt).getTime() : null;
         status[g] = {
             count: entry.windows.length,
+            allowed_user_ids: entry.allowed_user_ids,
             updatedAt: entry.updatedAt,
             stale: updatedAtMs === null ? true : (now - updatedAtMs) > WINDOWS_STALE_MS
         };
@@ -285,10 +305,14 @@ app.get("/get_signal", (req, res) => {
     return res.status(200).json({ status: "no_signal", signal: 0, symbol: "", id: "" });
 });
 
-// ==================== GET /get_windows (NEW in v4.6) ====================
-// EA calls this once per InpPollIntervalSec (per group) to fetch the
-// latest qualifying time-windows produced by the Pine "WINDOWS_UPDATE"
-// hourly alert. Response shape matches EA's ParseWindowsJson() exactly.
+// ==================== GET /get_windows (v4.6, user-scoped in v4.7) ====================
+// EA calls this once per InpPollIntervalSec (per group), passing its OWN
+// user_id. Response shape matches EA's ParseWindowsJson() exactly.
+//
+// ✅ FIX v4.7: user_id ab REQUIRED hai. Server sirf tabhi windows
+// deta hai jab requesting user_id us group ke allowed_user_ids mein ho.
+// Isse ek EA doosre ke user_id ka data fetch nahi kar sakta, chahe
+// usko token aur group dono pata ho.
 
 app.get("/get_windows", (req, res) => {
     console.log("  GET /get_windows endpoint called");
@@ -297,7 +321,7 @@ app.get("/get_windows", (req, res) => {
         return res.status(401).json({
             status: "unauthorized",
             message: "Invalid or missing token in URL",
-            example: "/get_windows?token=YOUR_TOKEN_HERE&group=A",
+            example: "/get_windows?token=YOUR_TOKEN_HERE&group=A&user_id=user_Asheen1",
             timestamp: new Date().toISOString()
         });
     }
@@ -307,11 +331,36 @@ app.get("/get_windows", (req, res) => {
         return res.status(400).json({
             status: "bad_request",
             message: "group query param must be 'A' or 'B'",
-            example: "/get_windows?token=YOUR_TOKEN_HERE&group=A",
+            example: "/get_windows?token=YOUR_TOKEN_HERE&group=A&user_id=user_Asheen1",
             timestamp: new Date().toISOString()
         });
     }
 
+    // ✅ FIX v4.7: user_id required
+    const requestedUserId = sanitizeUserId(req.query.user_id || "");
+    if (!requestedUserId) {
+        return res.status(400).json({
+            status: "bad_request",
+            message: "user_id query param is required",
+            example: "/get_windows?token=YOUR_TOKEN_HERE&group=A&user_id=user_Asheen1",
+            timestamp: new Date().toISOString()
+        });
+    }
+
+    const entry = windowsByGroup[group];
+    const allowList = entry.allowed_user_ids || [];
+
+    if (!allowList.includes(requestedUserId)) {
+        console.log("  /get_windows DENIED | Group " + group + " | user_id '" + requestedUserId +
+            "' not in allowed list [" + allowList.join(", ") + "]");
+        return res.status(403).json({
+            status: "forbidden",
+            message: "This user_id is not authorized for Group " + group + " windows",
+            timestamp: new Date().toISOString()
+        });
+    }
+
+    console.log("  /get_windows GRANTED | Group " + group + " | user_id '" + requestedUserId + "'");
     return res.status(200).json(buildWindowsResponse(group));
 });
 
@@ -440,10 +489,11 @@ app.post("/webhook", (req, res) => {
         });
     }
 
-    // ========== WINDOWS_UPDATE from TradingView (NEW in v4.6) ==========
+    // ========== WINDOWS_UPDATE from TradingView (v4.6, user-scoped v4.7) ==========
     // Sent hourly by both Group A and Group B Pine scripts. No trade
-    // signal — just the day's qualifying time-window schedule. Stored
-    // in windowsByGroup so the EA can pull it via GET /get_windows.
+    // signal — just the day's qualifying time-window schedule PLUS the
+    // list of user_ids this schedule applies to. Stored in windowsByGroup
+    // so the EA can pull it via GET /get_windows (with its own user_id).
     if (event_type === "WINDOWS_UPDATE") {
         const token = body.token || "";
         if (token !== SECRET_TOKEN) {
@@ -530,7 +580,7 @@ app.get("/status", (req, res) => {
         total_signals_processed: signal_history.length,
         windows_by_group: windowsByGroup,
         windows_feed_status: windowsFeedStatus(),
-        server_version: "4.6-queue-sl-raw-windows"
+        server_version: "4.7-queue-sl-raw-windows-userscoped"
     });
 });
 
@@ -538,12 +588,12 @@ app.get("/", (req, res) => {
     const hasSSL = fs.existsSync(SSL_CERT_PATH) && fs.existsSync(SSL_KEY_PATH);
     res.status(200).json({
         status: "running",
-        version: "4.6-queue-sl-raw-windows",
+        version: "4.7-queue-sl-raw-windows-userscoped",
         protocol: hasSSL ? "HTTPS" : "HTTP",
         endpoints: {
             "GET /get_signal?token=TOKEN&user_id=user_Asheen": "Primary MT5 signal endpoint",
             "GET /signal?token=TOKEN&user_id=user_Asheen": "Alternative signal endpoint",
-            "GET /get_windows?token=TOKEN&group=A|B": "EA polls this for live time-windows",
+            "GET /get_windows?token=TOKEN&group=A|B&user_id=user_Asheen": "EA polls this for live time-windows (user_id must be in allowed list)",
             "POST /webhook": "TradingView alerts (ALERT, WINDOWS_UPDATE, PING, GET_SIGNAL)",
             "GET /health": "Health check",
             "GET /status": "Detailed status"
@@ -625,7 +675,7 @@ function startHTTP() {
 function printBanner(protocol) {
     const sep = "=========================================================================";
     console.log("\n" + sep);
-    console.log("WEBHOOK SERVER v4.6 — QUEUE-BASED + SL_RAW + WINDOWS SUPPORT");
+    console.log("WEBHOOK SERVER v4.7 — QUEUE-BASED + SL_RAW + USER-SCOPED WINDOWS");
     console.log(sep);
     console.log("Protocol : " + protocol);
     console.log("Port     : " + PORT);
@@ -635,10 +685,14 @@ function printBanner(protocol) {
     console.log("  - FIFO order mein signals deliver honge");
     console.log("  - Per-user unique signal IDs");
     console.log("");
-    console.log("FIX v4.6 (NEW):");
+    console.log("FIX v4.6:");
     console.log("  - GET /get_windows?token=TOKEN&group=A|B endpoint added");
     console.log("  - POST /webhook now handles event:'WINDOWS_UPDATE' from Pine scripts");
-    console.log("  - EA ka window poll ab actually kaam karega (pehle 404 milta tha)");
+    console.log("");
+    console.log("FIX v4.7 (NEW):");
+    console.log("  - /get_windows ab user_id REQUIRE karta hai");
+    console.log("  - Windows sirf unhi user_ids ko milte hain jo WINDOWS_UPDATE ke");
+    console.log("    user_ids[] list mein the — koi aur user_id 403 pe reject hoga");
     console.log("");
     console.log("TradingView BUY alert  → sl_raw = {{low}}");
     console.log("TradingView SELL alert → sl_raw = {{high}}");
